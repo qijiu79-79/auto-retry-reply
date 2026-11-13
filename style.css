@@ -17,6 +17,13 @@
     opacity: 0.8;
 }
 
+/* Tavern's min-content button width otherwise wraps Chinese one glyph per line. */
+#auto-retry-reply-settings button.menu_button {
+    width: auto;
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
 #auto-retry-reply-settings [data-status],
 #auto-retry-reply-settings [data-update-status] {
     overflow-wrap: anywhere;
