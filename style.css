@@ -1,0 +1,23 @@
+#auto-retry-reply-settings .inline-drawer-content > * {
+    margin-block: 8px;
+}
+
+#auto-retry-reply-settings .arr-numbers {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+
+#auto-retry-reply-settings .arr-numbers label {
+    flex: 1 1 160px;
+}
+
+#auto-retry-reply-settings small {
+    display: block;
+    opacity: 0.8;
+}
+
+#auto-retry-reply-settings [data-status] {
+    overflow-wrap: anywhere;
+    font-size: 0.9em;
+}

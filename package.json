@@ -1,0 +1,11 @@
+{
+  "name": "sillytavern-auto-retry-reply",
+  "version": "1.1.1-delivery.1",
+  "private": true,
+  "type": "module",
+  "description": "SillyTavern extension-only reply retries and scoped result recovery",
+  "license": "AGPL-3.0-only",
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test tests/*.test.mjs" },
+  "repository": { "type": "git", "url": "https://github.com/qijiu79-79/auto-retry-reply.git" }
+}
