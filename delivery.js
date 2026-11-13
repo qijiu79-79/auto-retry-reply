@@ -34,6 +34,13 @@ function deliveryError(message = FAILURE) {
     return error;
 }
 
+// Only the companion bridge can mark its completed API error. A plain 502/504
+// from a disconnected proxy is not evidence that the saved attempt has failed.
+export function isRecordedApiFailure(value) {
+    return value?.g4keep?.version === 1 && value.g4keep.outcome === 'failed'
+        && Number.isInteger(value?.error?.code) && value.error.code >= 400 && value.error.code <= 599;
+}
+
 function eventData(frame) {
     return frame.split(/\r\n|\r|\n/).filter(x => x.startsWith('data:')).map(x => x.slice(5).replace(/^ /, '')).join('\n');
 }
@@ -135,10 +142,11 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
             buffered.push(raw);
             const isEnd = Boolean(json?.error) || (Array.isArray(json?.candidates) && json.candidates.some(c => typeof c?.finishReason === 'string' && c.finishReason));
             if (isEnd) {
-                // Once delivery owns the request, even an ordinary 502/504 may
-                // be a lost result after the upstream accepted and charged it.
-                if (json?.error) blockRetry(FAILURE);
-                output.push(encoder.encode(buffered.join(''))); buffered = []; complete = true; break;
+                if (json?.error && !isRecordedApiFailure(json)) blockRetry(FAILURE);
+                // On a recorded failure, no buffered partial reply has reached
+                // Tavern. Hand only the error back to its original retry rules.
+                output.push(encoder.encode(json?.error ? raw : buffered.join('')));
+                buffered = []; complete = true; break;
             }
         }
         if (bufferedBytes + pendingBytes > LIMIT) throw deliveryError();

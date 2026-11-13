@@ -60,6 +60,18 @@ test('defaults to 20 extra attempts, two seconds, and clamps corrupt settings', 
     assert.equal(normalizeSettings({ maxRetries: 0, delayMs: 90000 }).delayMs, 60000);
 });
 
+test('refresh safety gate includes initial generation and pending automatic swipe', async () => {
+    const h=harness();
+    assert.equal(h.controller.hasPendingWork(),false);
+    h.controller.onStart('normal');assert.equal(h.controller.hasPendingWork(),true);
+    h.controller.cancel();assert.equal(h.controller.hasPendingWork(),false);
+    h.reply('');assert.equal(h.controller.hasPendingWork(),true);
+    // The old stop-button predicate deliberately has different semantics.
+    assert.equal(h.controller.isRetrying(),false);
+    await h.tick();assert.equal(h.controller.hasPendingWork(),false);
+    h.reply('');h.controller.cancel();assert.equal(h.controller.hasPendingWork(),false);
+});
+
 for (const streaming of [false, true]) {
     test(`one retry after empty completion, streaming=${streaming}`, async () => {
         const h = harness();

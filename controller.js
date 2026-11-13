@@ -272,5 +272,7 @@ export function createRetryController({ getState, getSettings, retry, notify = (
         onSwiped: () => { if (!launching && pending) cancel('已手动切换回复'); },
         cancelPending: () => { if (pending || apiWait) cancel('回复已编辑或删除'); },
         isRetrying: () => Boolean(launching || active?.owned || active?.apiRetrying || apiWait),
+        // Read-only safety gate for extension-update refresh; retry policy is unchanged.
+        hasPendingWork: () => Boolean(active || pending || launching || inFlight || apiWait),
     };
 }

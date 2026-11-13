@@ -1,7 +1,9 @@
-import { isGenerating, swipe } from '../../../../script.js';
+import { isGenerating, swipe, getRequestHeaders } from '../../../../script.js';
 import { SWIPE_DIRECTION, SWIPE_SOURCE, SWIPE_STATE } from '../../../constants.js';
+import { extensionTypes } from '../../../extensions.js';
 import { createRetryController, DEFAULT_SETTINGS, normalizeSettings } from './controller.js';
 import { createRetryFetch } from './fetch-retry.js';
+import { createExtensionUpdater, refreshBlockedReason, MESSAGE_EDIT_SELECTOR } from './updater.js';
 
 const KEY = 'auto_retry_reply';
 const context = () => SillyTavern.getContext();
@@ -18,7 +20,7 @@ function getState() {
         busy: isGenerating() || Boolean(stream) || ctx.swipe.state() !== SWIPE_STATE.NONE,
         streamFailed: Boolean(stream?.isStopped || stream?.abortController?.signal.aborted),
         blocked: ctx.onlineStatus === 'no_connection' ? 'API 未连接，已取消自动重试'
-            : document.querySelector('#chat .mes .mes_edit_textarea') ? '正在编辑消息，已取消自动重试' : '',
+            : document.querySelector(MESSAGE_EDIT_SELECTOR) ? '正在编辑消息，已取消自动重试' : '',
     };
 }
 
@@ -97,7 +99,7 @@ function initialize() {
                 </label>
                 <small>免补丁版：只安装扩展，不修改酒馆原程序，不影响源码更新。只处理单角色聊天。空回 / 道歉会新建回复版本，原文仍可左右切换；续写内容检测失败时重新生成整条回复。API 错误会重发同一请求，不重发用户输入、不删除旧消息；三类重试共用上限。</small>
                 <small>指定反代上的 Argon 首次请求走普通线路，自动重试走防超时线路；历史思考签名仍可能触发保护。其他模型和地址不变。</small>
-                <small>个人 Carbon 保护请求断线时，优先取回同一次生成，完成结果最多暂存 10 分钟。后台不按失联计时；取回失败或结果状态未知时停止自动重发，避免重复扣费。此功能不修改共享预设。</small>
+                <small>Carbon 保护请求断线时，优先取回同一次生成，完成结果最多暂存 10 分钟。后台不按失联计时；桥已记录的普通 API 报错按原设置重试，取回失败或结果状态未知时停止自动重发。失败尝试也可能已计费。此功能不分 Key、不修改共享预设。</small>
                 <small>流式回复已经输出事件后再出错，不自动重发，会保留片段并停止本轮重试，请手动重新生成；这样不会把新旧正文、思考或工具调用拼在一起。</small>
                 <small>道歉检测仅处理少于 1000 字符的整条正文，达到 1000 字符即跳过；思考内容不计入。短回复中的正常道歉台词仍可能命中，可删改关键词或关闭道歉检测。API 错误不受字数限制；密钥错误、余额不足、明确内容限制等不重试。重试会额外调用当前 API 并可能计费。停止生成、切换聊天、修改设置可取消重试；限流时遵守服务端等待时间。</small>
                 <div class="flex-container">
@@ -105,6 +107,14 @@ function initialize() {
                     <button type="button" class="menu_button" data-action="reset-keywords">恢复默认关键词</button>
                 </div>
                 <div data-status role="status" aria-live="polite">已就绪，等待下一次模型回复</div>
+                <hr>
+                <small>当前版本：1.1.2 · 使用酒馆原生更新，保留原设置</small>
+                <div class="flex-container arr-update">
+                    <button type="button" class="menu_button" data-action="check-update">检查更新</button>
+                    <button type="button" class="menu_button" data-action="install-update" hidden>安装更新</button>
+                    <button type="button" class="menu_button" data-action="cancel-refresh" hidden>取消自动刷新</button>
+                </div>
+                <div data-update-status role="status" aria-live="polite">可手动检查；安装成功后自动刷新，有生成或草稿时等待。</div>
             </div>
         </div>`;
     const host = document.getElementById('extensions_settings');
@@ -132,6 +142,26 @@ function initialize() {
         controller.cancel('关键词已重置');
         fillSettings();
     });
+
+    const checkUpdate = panel.querySelector('[data-action="check-update"]');
+    const installUpdate = panel.querySelector('[data-action="install-update"]');
+    const cancelRefresh = panel.querySelector('[data-action="cancel-refresh"]');
+    const updater = createExtensionUpdater({
+        fetch: (...args) => window.fetch(...args), getRequestHeaders,
+        getExtensionType: () => extensionTypes['third-party/auto-retry-reply'],
+        getBlockedReason: () => refreshBlockedReason(document, getState().busy || controller.hasPendingWork()),
+        reload: () => window.location.reload(),
+        onState: ({ phase, message }) => {
+            panel.querySelector('[data-update-status]').textContent = message;
+            checkUpdate.disabled = ['checking', 'updating', 'waiting-reload', 'reloading'].includes(phase);
+            installUpdate.hidden = phase !== 'available';
+            cancelRefresh.hidden = !['waiting-reload', 'reloading'].includes(phase);
+        },
+    });
+    checkUpdate.addEventListener('click', () => void updater.check());
+    installUpdate.addEventListener('click', () => void updater.update());
+    cancelRefresh.addEventListener('click', () => updater.cancelRefresh());
+    window.addEventListener('pagehide', event => { if (!event.persisted) updater.dispose(); });
 
     const { eventSource, eventTypes } = context();
     eventSource.on(eventTypes.GENERATION_STARTED, controller.onStart);

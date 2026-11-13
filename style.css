@@ -17,7 +17,12 @@
     opacity: 0.8;
 }
 
-#auto-retry-reply-settings [data-status] {
+#auto-retry-reply-settings [data-status],
+#auto-retry-reply-settings [data-update-status] {
     overflow-wrap: anywhere;
     font-size: 0.9em;
+}
+
+#auto-retry-reply-settings .arr-update [hidden] {
+    display: none;
 }
