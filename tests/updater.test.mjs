@@ -32,6 +32,71 @@ const repo = { isUpToDate: false, currentCommitHash: 'abc123', remoteUrl: 'https
 const updated = { isUpToDate: false, shortCommitHash: 'def456', remoteUrl: repo.remoteUrl };
 const response = data => () => new Response(JSON.stringify(data));
 const phase = h => h.states.at(-1)?.phase;
+const flush = () => new Promise(resolve => setImmediate(resolve));
+
+test('transient version failures retry only the check with a delay and the same scope', async () => {
+    for (const failure of [500, 502, 503, 504, 'network']) {
+        for (const type of ['local', 'global']) {
+            const h = harness({ type });
+            h.results.push(() => {
+                if (failure === 'network') throw new TypeError('Load failed');
+                return new Response('Internal Server Error', { status: failure });
+            }, response(repo));
+            const pending = h.updater.check(); await flush();
+            assert.equal(phase(h), 'checking'); assert.match(h.states.at(-1).message, /重试/);
+            await h.updater.check(); await h.updater.update(); assert.equal(h.calls.length, 1);
+            h.tick(1499); await flush(); assert.equal(h.calls.length, 1);
+            h.tick(1); assert.equal((await pending).phase, 'available');
+            assert.deepEqual(h.calls.map(x => x.path), ['/api/extensions/version', '/api/extensions/version']);
+            for (const { options } of h.calls) {
+                assert.deepEqual(JSON.parse(options.body), { extensionName: 'auto-retry-reply', global: type === 'global' });
+            }
+            assert.equal(h.reloads, 0); assert.equal(h.timers.size, 0);
+        }
+    }
+});
+
+test('persistent version failures stop after two retries, explain the fallback, and permit a later manual check', async () => {
+    const h = harness();
+    for (const status of [500, 502, 503]) h.results.push(() => new Response('', { status }));
+    const pending = h.updater.check(); await flush();
+    h.tick(1500); await flush(); h.tick(1500);
+    const result = await pending;
+    assert.equal(result.phase, 'error'); assert.match(result.message, /503/); assert.match(result.message, /管理扩展程序/);
+    await h.updater.update(); assert.equal(h.calls.length, 3); assert.equal(h.reloads, 0); assert.equal(h.timers.size, 0);
+    h.results.push(response({ ...repo, isUpToDate: true }));
+    assert.equal((await h.updater.check()).phase, 'current');
+});
+
+test('authorization, rate limits, bad responses and install failures are not automatically retried', async () => {
+    for (const status of [400, 401, 403, 404, 429]) {
+        const h = harness(); h.results.push(() => new Response('', { status }));
+        assert.equal((await h.updater.check()).phase, 'error');
+        assert.equal(h.calls.length, 1); assert.equal(h.timers.size, 0);
+    }
+    const invalid = harness(); invalid.results.push(() => new Response('bad json'));
+    assert.equal((await invalid.updater.check()).phase, 'error'); assert.equal(invalid.calls.length, 1);
+    const h = harness(); h.results.push(response(repo), () => new Response('', { status: 500 }));
+    await h.updater.check(); assert.equal((await h.updater.update()).phase, 'error');
+    assert.deepEqual(h.calls.map(x => x.path), ['/api/extensions/version', '/api/extensions/update']);
+    h.tick(60000); assert.equal(h.calls.length, 2); assert.equal(h.reloads, 0); assert.equal(h.timers.size, 0);
+});
+
+test('dispose during a version retry delay settles the check without another request', async () => {
+    const h = harness(); h.results.push(() => new Response('', { status: 500 }));
+    const pending = h.updater.check(); await flush();
+    assert.equal(h.timers.size, 1);
+    h.updater.dispose(); await pending; h.tick(60000);
+    assert.equal(h.calls.length, 1); assert.equal(h.reloads, 0); assert.equal(h.timers.size, 0);
+});
+
+test('a changed installation scope during the retry delay stops rather than checking the old location', async () => {
+    const h = harness(); h.results.push(() => new Response('', { status: 500 }));
+    const pending = h.updater.check(); await flush(); h.context.type = 'global'; h.tick(1500);
+    const result = await pending;
+    assert.equal(result.phase, 'error'); assert.match(result.message, /位置发生变化/);
+    await h.updater.update(); assert.equal(h.calls.length, 1); assert.equal(h.timers.size, 0);
+});
 
 test('native check and update use detected local/global scope and reload after success', async () => {
     for (const type of ['local', 'global']) {

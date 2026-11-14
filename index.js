@@ -112,7 +112,7 @@ function initialize() {
                 </div>
                 <div data-status role="status" aria-live="polite">已就绪，等待下一次模型回复</div>
                 <hr>
-                <small>当前版本：1.1.5 · 使用酒馆原生更新，保留原设置</small>
+                <small>当前版本：1.1.6 · 使用酒馆原生更新，保留原设置</small>
                 <div class="flex-container arr-update">
                     <button type="button" class="menu_button" data-action="check-update">检查更新</button>
                     <button type="button" class="menu_button" data-action="install-update" hidden>安装更新</button>

@@ -1,6 +1,8 @@
 // Use SillyTavern's own extension updater, without modifying its settings.
 const EXTENSION = 'auto-retry-reply';
 const REFRESH_DELAY = 1000;
+const CHECK_RETRIES = 2;
+const CHECK_RETRY_DELAY = 1500;
 export const MESSAGE_EDIT_SELECTOR = '#chat .edit_textarea, #chat .mes_edit_textarea, #chat .reasoning_edit_textarea';
 
 export function refreshBlockedReason(document, busy) {
@@ -51,10 +53,20 @@ export function createExtensionUpdater({ fetch, getRequestHeaders, getExtensionT
                 method: 'POST', headers: getRequestHeaders(), signal: abort.signal,
                 body: JSON.stringify({ extensionName: EXTENSION, global: type === 'global' }),
             }), timeout]);
-            if (!response.ok) throw new Error(`请求失败（${response.status}）`);
+            if (!response.ok) {
+                response.body?.cancel().catch(() => {});
+                throw Object.assign(new Error(`请求失败（${response.status}）`), {
+                    retryableCheck: [500, 502, 503, 504].includes(response.status),
+                });
+            }
             // Include response parsing in the timeout; a stalled body must not
             // prevent the user from trying a later manual check.
             return await Promise.race([response.json(), timeout]);
+        } catch (error) {
+            if (error?.name === 'TypeError' && !abort.signal.aborted) {
+                throw Object.assign(new Error('网络连接失败'), { retryableCheck: true });
+            }
+            throw error;
         } finally {
             clearTimer(timer);
             if (activeAbort === abort) { activeAbort = null; activeCancel = null; }
@@ -63,6 +75,24 @@ export function createExtensionUpdater({ fetch, getRequestHeaders, getExtensionT
     const validRepo = data => typeof data?.isUpToDate === 'boolean'
         && typeof data.remoteUrl === 'string' && Boolean(data.remoteUrl.trim());
 
+    async function checkVersion(type) {
+        for (let attempt = 0; ; attempt++) {
+            try { return await request('/api/extensions/version', type, 30000); }
+            catch (error) {
+                // Version queries may fail transiently while Tavern fetches
+                // Git metadata. Never repeat an install or a timed-out query.
+                if (disposed || !error?.retryableCheck || attempt >= CHECK_RETRIES) throw error;
+                emit('checking', `检查暂时失败，正在重试（${attempt + 1}/${CHECK_RETRIES}）…`);
+                await new Promise((resolve, reject) => {
+                    const timer = setTimer(() => { activeCancel = null; resolve(); }, CHECK_RETRY_DELAY);
+                    activeCancel = () => { clearTimer(timer); activeCancel = null; reject(new Error('已取消')); };
+                });
+                if (disposed) throw new Error('已取消');
+                if (scope() !== type) throw new Error('扩展安装位置发生变化，请重新检查更新');
+            }
+        }
+    }
+
     async function check() {
         if (disposed || busy || pendingRefresh) return state;
         const type = scope();
@@ -70,7 +100,7 @@ export function createExtensionUpdater({ fetch, getRequestHeaders, getExtensionT
         if (!type) return emit('error', '无法确定扩展安装位置，请在管理扩展程序中更新');
         busy = true; emit('checking', '正在检查更新…');
         try {
-            const data = await request('/api/extensions/version', type, 30000);
+            const data = await checkVersion(type);
             if (disposed) return state;
             if (!validRepo(data) || typeof data.currentCommitHash !== 'string' || !data.currentCommitHash.trim()) {
                 return emit('error', '无法确认版本，请检查扩展是否通过 Git 安装');
@@ -79,7 +109,7 @@ export function createExtensionUpdater({ fetch, getRequestHeaders, getExtensionT
             availableScope = type;
             return emit('available', '发现可用更新，可点击更新');
         } catch (error) {
-            return emit('error', `检查更新失败：${error?.message || '请稍后重试'}`);
+            return emit('error', `检查更新失败：${error?.message || '请稍后重试'}；可稍后重试，或在“管理扩展程序”中更新`);
         } finally { busy = false; }
     }
 
