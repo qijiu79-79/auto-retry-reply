@@ -47,6 +47,20 @@ function harness(overrides = {}) {
         setReply: text => { nextReply = text; }, setAction: fn => { action = fn; } };
 }
 
+test('delivery failure emits a visible-error event once; manual and stale cancellation do not', () => {
+    const h = harness(), request = { type: 'normal' };
+    h.controller.onStart('normal'); assert.equal(h.controller.onRequestStarted(request), true);
+    h.controller.cancelRequest(request, 'synthetic retrieval failure', { deliveryFailure: true });
+    h.controller.cancelRequest(request, 'duplicate', { deliveryFailure: true });
+    assert.equal(h.notices.filter(x => x.kind === 'delivery-error').length, 1);
+    assert.equal(h.notices.at(-1).reason, 'synthetic retrieval failure');
+    h.controller.onStart('normal');
+    h.controller.cancelRequest(request, 'stale', { deliveryFailure: true });
+    assert.equal(h.notices.at(-1).kind, 'monitoring');
+    h.controller.cancel();
+    assert.equal(h.notices.filter(x => x.kind === 'delivery-error').length, 1);
+});
+
 test('defaults to 20 extra attempts, two seconds, and clamps corrupt settings', () => {
     assert.equal(DEFAULT_SETTINGS.maxRetries, 20);
     assert.equal(DEFAULT_SETTINGS.delayMs, 2000);

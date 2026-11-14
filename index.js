@@ -47,6 +47,10 @@ function notify(event) {
             console.error('[auto-retry-reply]', event.error);
             toastr.error(text, '自动重试');
             break;
+        case 'delivery-error':
+            text = event.reason;
+            toastr.error(text, '结果取回失败', { escapeHtml: true, timeOut: 10000, extendedTimeOut: 10000 });
+            break;
         default: text = event.reason || '已就绪';
     }
     if (panel) panel.querySelector('[data-status]').textContent = text;
@@ -99,7 +103,7 @@ function initialize() {
                 </label>
                 <small>免补丁版：只安装扩展，不修改酒馆原程序，不影响源码更新。只处理单角色聊天。空回 / 道歉会新建回复版本，原文仍可左右切换；续写内容检测失败时重新生成整条回复。API 错误会重发同一请求，不重发用户输入、不删除旧消息；三类重试共用上限。</small>
                 <small>指定反代上的 Argon 首次请求走普通线路，自动重试走防超时线路；历史思考签名仍可能触发保护。其他模型和地址不变。</small>
-                <small>Carbon 保护请求断线时，优先取回同一次生成，完成结果最多暂存 10 分钟。后台不按失联计时；桥已记录的普通 API 报错按原设置重试，取回失败或结果状态未知时停止自动重发。失败尝试也可能已计费。此功能不分 Key、不修改共享预设。</small>
+                <small>Carbon 保护请求断线时，优先取回同一次生成；当前配套桥从收到完整结果起最多暂存 5 分钟。同 Key 下一次保护生成受理时可提前清理旧结果。后台不按失联计时；桥已记录的普通 API 报错按原设置重试，取回失败或结果状态未知时明确提示并停止自动重发。失败尝试也可能已计费。此功能不分 Key、不修改共享预设。</small>
                 <small>流式回复已经输出事件后再出错，不自动重发，会保留片段并停止本轮重试，请手动重新生成；这样不会把新旧正文、思考或工具调用拼在一起。</small>
                 <small>道歉检测仅处理少于 1000 字符的整条正文，达到 1000 字符即跳过；思考内容不计入。短回复中的正常道歉台词仍可能命中，可删改关键词或关闭道歉检测。API 错误不受字数限制；密钥错误、余额不足、明确内容限制等不重试。重试会额外调用当前 API 并可能计费。停止生成、切换聊天、修改设置可取消重试；限流时遵守服务端等待时间。</small>
                 <div class="flex-container">
@@ -108,7 +112,7 @@ function initialize() {
                 </div>
                 <div data-status role="status" aria-live="polite">已就绪，等待下一次模型回复</div>
                 <hr>
-                <small>当前版本：1.1.4 · 使用酒馆原生更新，保留原设置</small>
+                <small>当前版本：1.1.5 · 使用酒馆原生更新，保留原设置</small>
                 <div class="flex-container arr-update">
                     <button type="button" class="menu_button" data-action="check-update">检查更新</button>
                     <button type="button" class="menu_button" data-action="install-update" hidden>安装更新</button>

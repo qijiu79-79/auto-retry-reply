@@ -116,15 +116,36 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
             terminate(); throw new DOMException('Request cancelled', 'AbortError');
         }
     }
+    async function transientHttp(response) {
+        if (![408, 429].includes(response.status) && !(response.status >= 500 && response.status <= 599)) return false;
+        // Tavern turns an upstream fetch/TLS failure into HTTP 500 {error:true}.
+        // That does not tell us whether the bridge accepted the start. Query
+        // the same ID; never translate a plain HTTP failure into a new start.
+        let detail;
+        try { detail = await Promise.race([response.clone().json(), watch]); } catch {}
+        if (stopped || signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
+        return !String(detail?.error?.code ?? '').startsWith('G4_DELIVERY_') && !isRecordedApiFailure(detail);
+    }
+    const discardConnection = response => {
+        current?.abort();
+        response.body?.cancel().catch(() => {});
+    };
     const resume = async () => {
         while (attempts < 3 && !stopped && !signal?.aborted && valid()) {
             await waitForForeground();
             attempts++;
-            try { return await connect('resume'); } catch (e) { if (stopped || signal?.aborted) throw e; }
+            try {
+                const next = await connect('resume');
+                if (await transientHttp(next)) { discardConnection(next); continue; }
+                return next;
+            } catch (e) { if (stopped || signal?.aborted) throw e; }
         }
         throw deliveryError();
     };
-    const fail = error => { blockRetry(FAILURE); cleanup(); throw error?.name === 'AbortError' ? error : deliveryError(); };
+    const fail = error => {
+        if (!stopped && !signal?.aborted && error?.name !== 'AbortError') blockRetry(FAILURE);
+        cleanup(); throw error?.name === 'AbortError' ? error : deliveryError();
+    };
     try {
         let directStartResponse = false;
         try { response = await connect('start'); directStartResponse = true; }
@@ -135,6 +156,7 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
                 cleanup(); return fetch(input, options);
             }
         }
+        if (await transientHttp(response)) { discardConnection(response); response = await resume(); }
         if (!response.ok || !response.body) throw deliveryError();
     } catch (error) { return fail(error); }
 

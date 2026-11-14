@@ -105,6 +105,26 @@ test('4c unknown delivery failure and missing resume never regenerate', async ()
     assert.deepEqual(missing.delays, []);
 });
 
+test('4c Tavern HTTP 500 queries only the same ID and gives one visible final failure when missing', async () => {
+    const h = harness('gemini-4-carbon', proxy => proxy.endsWith('/start')
+        ? json({ error: true }, 500) : json({ error: { code: 'G4_DELIVERY_MISSING' } }, 410));
+    await assert.rejects(h.send(), /可能已扣费/);
+    const paths = h.calls.map(url => new URL(url).pathname.split('/'));
+    assert.deepEqual(paths.map(x => x.at(-1)), ['start', 'resume']);
+    assert.equal(paths[0][2], paths[1][2]); assert.deepEqual(h.delays, []);
+    assert.equal(h.notices.filter(x => x.kind === 'delivery-error').length, 1);
+});
+
+test('4c generic proxy 500 is recovered, then only a recorded API failure can authorize a new generation', async () => {
+    const h = harness('gemini-4-carbon', (_proxy, count) => count === 1 ? json({ error: true }, 500)
+        : count === 2 ? sse(failed(502)) : sse(complete));
+    assert.match(await (await h.send()).text(), /NEW-RESULT/);
+    const paths = h.calls.map(url => new URL(url).pathname.split('/'));
+    assert.deepEqual(paths.map(x => x.at(-1)), ['start', 'resume', 'start']);
+    assert.equal(paths[0][2], paths[1][2]); assert.notEqual(paths[0][2], paths[2][2]);
+    assert.deepEqual(h.delays, [1500]); assert.equal(h.notices.filter(x => x.kind === 'delivery-error').length, 0);
+});
+
 test('4c plain or malformed failure markers do not authorize regeneration', async () => {
     for (const marker of [undefined, { version: 2, outcome: 'failed' }, { version: 1, outcome: 'unknown' },
         { version: 1, outcome: 'not_dispatched' }]) {

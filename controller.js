@@ -107,9 +107,12 @@ export function createRetryController({ getState, getSettings, retry, notify = (
         return { runId: run.runId, attempt: run.attempts };
     }
 
-    function cancelRequest(request, reason) {
+    function cancelRequest(request, reason, { deliveryFailure = false } = {}) {
         const run = requestRuns.get(request);
-        if (run && active === run) cancel(reason);
+        if (run && active === run) {
+            cancel(reason);
+            if (deliveryFailure) notify({ kind: 'delivery-error', reason });
+        }
     }
 
     async function onRequestFailed(event) {

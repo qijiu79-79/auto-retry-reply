@@ -48,6 +48,94 @@ test('resume before first response uses same ID and never repeats start', async 
     assert(calls.every(x => x.includes(id)));
     assert.equal(env.blocked.length, 0);
 });
+
+test('Tavern HTTP 500 after a lost upstream connection resumes the same ID without changing content or effort', async () => {
+    const calls = [], requests = [];
+    const env = setup((_url, opts) => {
+        const request = JSON.parse(opts.body); calls.push(action(opts)); requests.push(request);
+        return Promise.resolve(action(opts) === 'start'
+            ? new Response(JSON.stringify({ error: true }), { status: 500 }) : stream([finish]));
+    });
+    env.args.payload = { ...payload, reasoning_effort: 'high', max_tokens: 40000,
+        messages: [{ role: 'user', content: 'synthetic original prompt' }] };
+    env.args.options.body = JSON.stringify(env.args.payload);
+    assert.match(await (await deliveryFetch(env.args)).text(), /NEW/);
+    assert.deepEqual(calls, ['start', 'resume']); assert.deepEqual(env.blocked, []);
+    for (const request of requests) {
+        assert.match(request.reverse_proxy, new RegExp('/' + id + '/'));
+        assert.deepEqual({ ...request, reverse_proxy: payload.reverse_proxy }, env.args.payload);
+    }
+});
+
+test('transient HTTP errors during recovery use the same three-attempt budget, not new generations', async () => {
+    for (const success of [true, false]) {
+        const calls = [];
+        const env = setup((_url, opts) => {
+            calls.push(action(opts));
+            return Promise.resolve(success && calls.length === 4 ? stream([finish])
+                : new Response('temporary proxy error', { status: calls.length === 1 ? 500 : 503 }));
+        });
+        if (success) { assert.match(await (await deliveryFetch(env.args)).text(), /NEW/); assert.deepEqual(env.blocked, []); }
+        else { await assert.rejects(deliveryFetch(env.args), /可能已扣费/); assert.equal(env.blocked.length, 1); }
+        assert.deepEqual(calls, ['start', 'resume', 'resume', 'resume']); assert.equal(env.clock.callbacks, 0);
+    }
+});
+
+test('a lost stream can recover through an intermediate HTTP 502', async () => {
+    const calls = [];
+    const env = setup((_url, opts) => {
+        calls.push(action(opts));
+        return Promise.resolve(calls.length === 1 ? stream([heartbeat, partial])
+            : calls.length === 2 ? new Response('proxy error', { status: 502 }) : stream([finish]));
+    });
+    const text = await (await deliveryFetch(env.args)).text();
+    assert.match(text, /NEW/); assert.doesNotMatch(text, /OLD/);
+    assert.deepEqual(calls, ['start', 'resume', 'resume']); assert.deepEqual(env.blocked, []);
+});
+
+test('definitive delivery and authorization rejections do not cause recovery loops', async () => {
+    for (const [status, code] of [[401, 'AUTH'], [403, 'G4_DELIVERY_AUTH'], [409, 'G4_DELIVERY_CONFLICT'],
+        [410, 'G4_DELIVERY_EXPIRED'], [503, 'G4_DELIVERY_BUSY']]) {
+        const calls = [];
+        const env = setup((_url, opts) => { calls.push(action(opts)); return Promise.resolve(new Response(
+            JSON.stringify({ error: { code } }), { status })); });
+        await assert.rejects(deliveryFetch(env.args), /可能已扣费/);
+        assert.deepEqual(calls, ['start']); assert.equal(env.blocked.length, 1);
+    }
+});
+
+test('Tavern HTTP 500 followed by missing recovery stops without a second start', async () => {
+    const calls = [];
+    const env = setup((_url, opts) => {
+        calls.push(action(opts));
+        return Promise.resolve(action(opts) === 'start' ? new Response('{"error":true}', { status: 500 })
+            : new Response('{"error":{"code":"G4_DELIVERY_MISSING"}}', { status: 410 }));
+    });
+    await assert.rejects(deliveryFetch(env.args), /可能已扣费/);
+    assert.deepEqual(calls, ['start', 'resume']); assert.equal(env.blocked.length, 1);
+});
+
+test('HTTP 500 while hidden waits for foreground and manual stop does not report a delivery failure', async () => {
+    for (const stop of [false, true]) {
+        const calls = []; let resolveStart;
+        const env = setup((_url, opts) => {
+            calls.push(action(opts));
+            return action(opts) === 'start' ? new Promise(resolve => { resolveStart = resolve; }) : Promise.resolve(stream([finish]));
+        });
+        const pending = deliveryFetch(env.args).then(r => r.text()).then(text => ({ text }), error => ({ error }));
+        env.clock.doc.change('hidden'); resolveStart(new Response('{"error":true}', { status: 500 }));
+        await new Promise(resolve => setTimeout(resolve, 10));
+        assert.deepEqual(calls, ['start']); assert.deepEqual(env.blocked, []);
+        if (stop) {
+            env.abort.abort(); assert.equal((await pending).error?.name, 'AbortError'); await flush();
+            assert.deepEqual(calls, ['start', 'cancel']); assert.deepEqual(env.blocked, []);
+        } else {
+            env.clock.doc.change('visible'); assert.match((await pending).text, /NEW/);
+            assert.deepEqual(calls, ['start', 'resume']); assert.deepEqual(env.blocked, []);
+        }
+        assert.equal(env.clock.callbacks, 0);
+    }
+});
 test('all four randomly selected preset tool prefixes opt in', async () => {
     for (const prefix of ['dispatch_stream_payload_', 'render_document_chunk_', 'stream_response_segment_', 'deliver_formatted_view_']) {
         const calls=[]; const env=setup((_url,opts)=>{calls.push(action(opts));return Promise.resolve(stream([finish]));});

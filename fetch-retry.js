@@ -62,7 +62,11 @@ export function createRetryFetch({ fetch: originalFetch, controller, baseUrl }) 
                     response = await deliveryFetch({ fetch: originalFetch, input,
                         options: routedOptions(payload, options, routing), payload, baseUrl, context: routing,
                         valid: () => Boolean(controller.getRoutingContext(request)) && !signal?.aborted,
-                        blockRetry: reason => { deliveryBlocked = true; controller.cancelRequest(request, reason); },
+                        blockRetry: reason => {
+                            if (deliveryBlocked) return;
+                            deliveryBlocked = true;
+                            controller.cancelRequest(request, reason, { deliveryFailure: true });
+                        },
                     });
                 } catch (error) {
                     if (await shouldRetry(error)) { retried = true; continue; }
