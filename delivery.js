@@ -56,12 +56,13 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
         body: JSON.stringify({ ...payload, reverse_proxy: `${BASE}/g4d1/${id}/${action}` }) });
     let issued = false, cancelSent = false, stopped = false, current, reader;
     let timer, last = now(), idle = 0, grace = 0, visible = doc?.visibilityState !== 'hidden';
-    let watchdogReject;
+    let watchdogReject, wakeForeground;
     const resetClock = () => { idle = 0; last = now(); };
     const visibility = () => {
         const next = doc?.visibilityState !== 'hidden';
         if (next && !visible) grace = graceMs;
         visible = next; resetClock();
+        if (visible) wakeForeground?.();
     };
     const sendCancel = () => {
         if (!issued || cancelSent) return;
@@ -74,6 +75,7 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
     const terminate = () => {
         if (stopped) return;
         stopped = true; current?.abort(); reader?.cancel().catch(() => {}); sendCancel();
+        wakeForeground?.();
         watchdogReject?.(new DOMException('Request cancelled', 'AbortError'));
     };
     const abortListener = () => terminate();
@@ -102,8 +104,21 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
         return Promise.race([fetch(input, requestOptions(action, current.signal)), watch]);
     }
     let attempts = 0, response;
+    async function waitForForeground() {
+        // A background network rejection is not a heartbeat timeout. Keep the
+        // same generation recoverable instead of exhausting all retries while
+        // the browser cannot use the network. Do not disturb a healthy stream.
+        while (!visible && !stopped && !signal?.aborted && valid()) {
+            await new Promise(resolve => { wakeForeground = resolve; });
+        }
+        wakeForeground = undefined;
+        if (stopped || signal?.aborted || !valid()) {
+            terminate(); throw new DOMException('Request cancelled', 'AbortError');
+        }
+    }
     const resume = async () => {
         while (attempts < 3 && !stopped && !signal?.aborted && valid()) {
+            await waitForForeground();
             attempts++;
             try { return await connect('resume'); } catch (e) { if (stopped || signal?.aborted) throw e; }
         }

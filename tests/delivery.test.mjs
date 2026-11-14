@@ -85,6 +85,83 @@ test('hidden time and a frozen callback do not count; foreground has grace', asy
     assert.deepEqual(calls, ['start', 'resume']);
 });
 
+test('a connection rejected in the background waits for foreground before spending recovery attempts', async t => {
+    const calls = []; let rejectStart;
+    const env = setup((_url, opts) => {
+        calls.push(action(opts));
+        if (action(opts) === 'start') return new Promise((_, reject) => { rejectStart = reject; });
+        if (env.clock.doc.visibilityState === 'hidden') return Promise.reject(new TypeError('background network unavailable'));
+        return Promise.resolve(stream([finish]));
+    });
+    t.after(() => env.abort.abort());
+    const result = deliveryFetch(env.args).then(r => r.text()).then(text => ({ text }), error => ({ error }));
+    env.clock.doc.change('hidden'); rejectStart(new TypeError('connection lost'));
+    await flush(); env.clock.step(4 * 60 * 1000); await flush();
+    assert.deepEqual(calls, ['start']); assert.deepEqual(env.blocked, []);
+    env.clock.doc.change('visible');
+    assert.match((await result).text, /NEW/);
+    assert.deepEqual(calls, ['start', 'resume']); assert.deepEqual(env.blocked, []);
+    assert.equal(env.clock.callbacks, 0);
+});
+
+test('a stream lost in the background keeps the same request recoverable on return', async t => {
+    const calls = []; let source;
+    const env = setup((_url, opts) => {
+        calls.push(action(opts));
+        if (action(opts) === 'start') return Promise.resolve(new Response(new ReadableStream({ start(c) { source = c; c.enqueue(heartbeat); } })));
+        if (env.clock.doc.visibilityState === 'hidden') return Promise.reject(new TypeError('background network unavailable'));
+        return Promise.resolve(stream([finish]));
+    });
+    t.after(() => env.abort.abort());
+    const response = await deliveryFetch(env.args);
+    const result = response.text().then(text => ({ text }), error => ({ error }));
+    env.clock.doc.change('hidden'); source.error(new TypeError('connection lost'));
+    await flush(); env.clock.step(4 * 60 * 1000); await flush();
+    assert.deepEqual(calls, ['start']); assert.deepEqual(env.blocked, []);
+    env.clock.doc.change('visible');
+    assert.match((await result).text, /NEW/);
+    assert.deepEqual(calls, ['start', 'resume']); assert.deepEqual(env.blocked, []);
+    assert.equal(env.clock.callbacks, 0);
+});
+
+test('stop or context change while waiting for foreground cancels once and never resumes', async () => {
+    for (const invalid of [false, true]) {
+        const calls = []; let rejectStart;
+        const env = setup((_url, opts) => {
+            calls.push(action(opts));
+            return action(opts) === 'start' ? new Promise((_, reject) => { rejectStart = reject; }) : Promise.resolve(new Response('{}'));
+        });
+        const pending = deliveryFetch(env.args);
+        const rejected = assert.rejects(pending, { name: 'AbortError' });
+        env.clock.doc.change('hidden'); rejectStart(new TypeError('connection lost')); await flush();
+        assert.deepEqual(calls, ['start']);
+        if (invalid) { env.invalidate(); env.clock.step(); } else env.abort.abort();
+        await rejected; await flush();
+        env.clock.doc.change('visible'); await flush();
+        assert.deepEqual(calls, ['start', 'cancel']); assert.equal(env.clock.callbacks, 0);
+    }
+});
+
+test('hiding a healthy response does not abort or reconnect it', async () => {
+    const calls = []; let source;
+    const env = setup((_url, opts) => {
+        calls.push(action(opts));
+        return Promise.resolve(new Response(new ReadableStream({ start(c) { source = c; c.enqueue(heartbeat); } })));
+    });
+    const response = await deliveryFetch(env.args), result = response.text();
+    env.clock.doc.change('hidden'); env.clock.step(4 * 60 * 1000); source.enqueue(finish);
+    assert.match(await result, /NEW/); assert.deepEqual(calls, ['start']);
+    assert.deepEqual(env.blocked, []); assert.equal(env.clock.callbacks, 0);
+});
+
+test('persistent foreground network errors still have a bounded recovery budget', async () => {
+    const calls = [];
+    const env = setup((_url, opts) => { calls.push(action(opts)); return Promise.reject(new TypeError('network unavailable')); });
+    await assert.rejects(deliveryFetch(env.args), /可能已扣费/);
+    assert.deepEqual(calls, ['start', 'resume', 'resume', 'resume']);
+    assert.equal(env.blocked.length, 1); assert.equal(env.clock.callbacks, 0);
+});
+
 test('a long event-loop freeze is not mistaken for lost heartbeats', async () => {
     const calls = [];
     const env = setup((_url, opts) => { calls.push(action(opts)); return action(opts) === 'start' ? forever() : Promise.resolve(stream([finish])); });
