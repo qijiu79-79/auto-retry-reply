@@ -1,6 +1,7 @@
 // Scoped, single-generation delivery recovery. Never resubmit a generation.
 const ENDPOINT = '/api/backends/chat-completions/generate';
 const BASE = 'https://api.doggego.online';
+const MODELS = new Set(['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high']);
 const LIMIT = 8 * 1024 * 1024;
 const FAILURE = '回复连接中断，未能取回结果；本次可能已扣费，请先检查记录，勿立即重试';
 
@@ -11,7 +12,7 @@ function eligible(input, options, payload, baseUrl, context) {
             && url.origin === new URL(baseUrl).origin && url.pathname === ENDPOINT
             && String(options?.method).toUpperCase() === 'POST' && typeof options?.body === 'string'
             && payload?.stream === true && payload.chat_completion_source === 'makersuite'
-            && payload.model === 'gemini-4-carbon' && /^https:\/\/api\.doggego\.online\/?$/.test(payload.reverse_proxy)
+            && MODELS.has(payload.model) && /^https:\/\/api\.doggego\.online\/?$/.test(payload.reverse_proxy)
             && /^[0-9a-f]{32}$/.test(context?.runId ?? '')
             && Array.isArray(payload.tools) && payload.tools.some(tool =>
                 /^(?:dispatch_stream_payload_|render_document_chunk_|stream_response_segment_|deliver_formatted_view_)[a-z0-9]{8,32}$/.test(tool?.function?.name ?? '')

@@ -37,6 +37,37 @@ function setup(fetch, extra = {}) {
     return { args, clock, abort, blocked, invalidate: () => { live = false; } };
 }
 
+for (const model of ['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high']) {
+    test(`${model} recovers the same ID and preserves model, effort and payload`, async () => {
+        const calls = [];
+        const original = { ...payload, model, reasoning_effort: 'medium', max_tokens: 40000,
+            messages: [{ role: 'user', content: 'synthetic input unchanged' }] };
+        const env = setup((_url, options) => {
+            calls.push(JSON.parse(options.body));
+            return Promise.resolve(calls.length === 1 ? stream([heartbeat, partial]) : stream([finish]));
+        });
+        env.args.payload = original; env.args.options.body = JSON.stringify(original);
+        assert.match(await (await deliveryFetch(env.args)).text(), /NEW/);
+        assert.deepEqual(calls.map(x => x.reverse_proxy.split('/').at(-1)), ['start', 'resume']);
+        for (const call of calls) {
+            assert(call.reverse_proxy.includes(id));
+            assert.deepEqual({ ...call, reverse_proxy: original.reverse_proxy }, original);
+        }
+        assert.deepEqual(env.blocked, []);
+    });
+}
+
+test('other models and unknown Carbon suffixes do not opt into delivery', async () => {
+    for (const model of ['gemini-4-argon', 'gemini-4-hydrogen', 'gemini-4-carbon-medium',
+        'gemini-4-carbon-high-extra', 'gemini-4-carbon-high-keepalive', 'gemini-4-carbonx']) {
+        const calls = [], original = { ...payload, model };
+        const env = setup((_url, options) => { calls.push(options.body); return Promise.resolve(stream([finish])); });
+        env.args.payload = original; env.args.options.body = JSON.stringify(original);
+        await (await deliveryFetch(env.args)).text();
+        assert.deepEqual(calls, [JSON.stringify(original)]);
+    }
+});
+
 test('resume before first response uses same ID and never repeats start', async () => {
     const calls = [];
     const env = setup((_url, opts) => { calls.push(JSON.parse(opts.body).reverse_proxy); return action(opts) === 'start' ? forever() : Promise.resolve(stream([finish])); });
