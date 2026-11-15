@@ -1,4 +1,4 @@
-// Scoped, single-generation delivery recovery. Never resubmit a generation.
+// Scoped, single-generation recovery. Retry only with proof of no dispatch.
 const ENDPOINT = '/api/backends/chat-completions/generate';
 const BASE = 'https://api.doggego.online';
 const MODELS = new Set(['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high']);
@@ -35,6 +35,17 @@ function deliveryError(message = FAILURE) {
     return error;
 }
 
+class UndispatchedError extends Error {
+    constructor(status = 503, retryAfter = null) {
+        super('连接未成功，本次尚未提交生成');
+        this.code = 'G4_DELIVERY_NOT_DISPATCHED';
+        this.status = status;
+        this.retryAfter = retryAfter;
+    }
+}
+// Local provenance: arbitrary API errors cannot claim permission to regenerate.
+export const isUndispatchedFailure = error => error instanceof UndispatchedError;
+
 // Only the companion bridge can mark its completed API error. A plain 502/504
 // from a disconnected proxy is not evidence that the saved attempt has failed.
 export function isRecordedApiFailure(value) {
@@ -53,8 +64,17 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
     const id = makeId();
     if (!/^[0-9a-f]{32}$/.test(id ?? '')) return fetch(input, options);
     const signal = options.signal;
-    const requestOptions = (action, privateSignal) => ({ ...options, signal: privateSignal,
-        body: JSON.stringify({ ...payload, reverse_proxy: `${BASE}/g4d1/${id}/${action}` }) });
+    let ticket, proof;
+    const requestOptions = (action, privateSignal) => {
+        const path = `${BASE}/g4d1/${id}/${action}${ticket && action !== 'prepare' ? '/' + ticket : ''}`;
+        // Do not upload the prompt, tools, images or sampling settings twice.
+        const body = action === 'prepare' ? {
+            chat_completion_source: payload.chat_completion_source, model: payload.model,
+            proxy_password: payload.proxy_password, stream: true, max_tokens: 1,
+            messages: [{ role: 'user', content: 'delivery prepare' }],
+        } : payload;
+        return { ...options, signal: privateSignal, body: JSON.stringify({ ...body, reverse_proxy: path }) };
+    };
     let issued = false, cancelSent = false, stopped = false, current, reader;
     let timer, last = now(), idle = 0, grace = 0, visible = doc?.visibilityState !== 'hidden';
     let watchdogReject, wakeForeground;
@@ -101,7 +121,7 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
     async function connect(action) {
         if (stopped || signal?.aborted || !valid()) { terminate(); throw new DOMException('Request cancelled', 'AbortError'); }
         current = new AbortController(); resetClock(); newWatch();
-        if (action === 'start') issued = true;
+        if (action === 'prepare') issued = true;
         return Promise.race([fetch(input, requestOptions(action, current.signal)), watch]);
     }
     let attempts = 0, response;
@@ -137,23 +157,48 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
             attempts++;
             try {
                 const next = await connect('resume');
+                if (next.status === 409) {
+                    let detail; try { detail = await Promise.race([next.clone().json(), watch]); } catch {}
+                    if (detail?.error?.code === 'G4_DELIVERY_NOT_DISPATCHED' && detail.not_dispatched === true
+                        && detail.g4keep?.version === 1 && detail.g4keep.outcome === 'not_dispatched'
+                        && detail.g4keep.proof === proof) {
+                        discardConnection(next); throw new UndispatchedError();
+                    }
+                }
                 if (await transientHttp(next)) { discardConnection(next); continue; }
                 return next;
-            } catch (e) { if (stopped || signal?.aborted) throw e; }
+            } catch (e) { if (stopped || signal?.aborted || isUndispatchedFailure(e)) throw e; }
         }
         throw deliveryError();
     };
     const fail = error => {
+        if (isUndispatchedFailure(error)) { cleanup(); throw error; }
         if (!stopped && !signal?.aborted && error?.name !== 'AbortError') blockRetry(FAILURE);
         cleanup(); throw error?.name === 'AbortError' ? error : deliveryError();
     };
     try {
+        // A prepare failure is safe to retry: no commit has ever been issued.
+        // Its server-side record alone cannot invoke a model, even if late.
+        try {
+            const prepared = await connect('prepare');
+            if (!prepared.ok) { discardConnection(prepared); throw new UndispatchedError(prepared.status, prepared.headers.get('Retry-After')); }
+            const detail = await Promise.race([prepared.json(), watch]);
+            if (detail?.g4keep?.version !== 1 || detail.g4keep.outcome !== 'prepared'
+                || !/^[a-f0-9]{32}$/.test(detail.g4keep.ticket ?? '')
+                || !/^[a-f0-9]{64}$/.test(detail.g4keep.proof ?? '')) throw new UndispatchedError(502);
+            ticket = detail.g4keep.ticket; proof = detail.g4keep.proof;
+        } catch (error) {
+            current?.abort();
+            await waitForForeground();
+            throw isUndispatchedFailure(error) ? error : new UndispatchedError();
+        }
         let directStartResponse = false;
-        try { response = await connect('start'); directStartResponse = true; }
+        try { response = await connect('commit'); directStartResponse = true; }
         catch (e) { if (stopped || signal?.aborted) throw e; response = await resume(); }
         if (directStartResponse && response.status === 403) {
             let error; try { error = await Promise.race([response.clone().json(), watch]); } catch {}
-            if (error?.error?.code === 'G4_DELIVERY_INELIGIBLE' && error.not_dispatched === true) {
+            if (error?.error?.code === 'G4_DELIVERY_INELIGIBLE' && error.not_dispatched === true
+                && error.g4keep?.version === 1 && error.g4keep.outcome === 'bypassed' && error.g4keep.proof === proof) {
                 cleanup(); return fetch(input, options);
             }
         }
@@ -213,8 +258,8 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
                 if (stopped) throw new DOMException('Request cancelled', 'AbortError');
                 cleanup(); controller.close();
             } catch (error) {
-                if (!stopped) blockRetry(FAILURE);
-                cleanup(); controller.error(error?.name === 'AbortError' ? error : deliveryError());
+                if (!stopped && !isUndispatchedFailure(error)) blockRetry(FAILURE);
+                cleanup(); controller.error(error?.name === 'AbortError' || isUndispatchedFailure(error) ? error : deliveryError());
             }
         },
         cancel() { terminate(); cleanup(); },
