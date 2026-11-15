@@ -17,12 +17,10 @@ const complete = { candidates: [{ content: { parts: [{ text: 'NEW-RESULT' }] }, 
 const sse = (...frames) => new Response(frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`).join(''),
     { headers: { 'Content-Type': 'text/event-stream' } });
 const json = (value, status) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
-const ticket = 'fedcba9876543210fedcba9876543210';
-const proofValue = 'abcdef0123456789'.repeat(4);
 const action = proxy => new URL(proxy).pathname.split('/').filter(Boolean)[2];
 
-function harness(model, respond, overrides = {}, payloadChanges = {}, prepareRespond) {
-    const calls = [], prepares = [], notices = [], delays = [];
+function harness(model, respond, overrides = {}, payloadChanges = {}) {
+    const calls = [], notices = [], delays = [];
     const abort = new AbortController();
     const settings = { ...DEFAULT_SETTINGS, delayMs: 1500, maxRetries: 2, ...overrides };
     const state = { key: 'test-chat', groupId: null, chat: [{ mes: 'synthetic user input', is_user: true }], busy: true, blocked: '' };
@@ -35,27 +33,31 @@ function harness(model, respond, overrides = {}, payloadChanges = {}, prepareRes
     });
     const adapter = createRetryFetch({ controller, baseUrl: 'http://localhost:8000/', fetch: async (_url, options) => {
         const proxy = JSON.parse(options.body).reverse_proxy;
-        if (action(proxy) === 'prepare') {
-            prepares.push(JSON.parse(options.body));
-            return prepareRespond ? prepareRespond(proxy, prepares.length)
-                : json({ g4keep: { version: 1, outcome: 'prepared', ticket, proof: proofValue } }, 200);
-        }
         calls.push(proxy);
         return respond(proxy, calls.length);
     } });
     controller.onStart('normal');
-    return { calls, prepares, notices, delays, settings, state, abort, controller,
+    return { calls, notices, delays, settings, state, abort, controller,
         onNotice: fn => { onNotice = fn; },
         send: () => adapter(endpoint, { method: 'POST', signal: abort.signal,
             body: JSON.stringify({ ...common, model, ...payloadChanges }) }) };
 }
 
-test('prepare transient errors preserve the server Retry-After delay', async () => {
-    const h = harness('gemini-4-carbon', () => sse(complete), {}, {}, (_proxy, count) => count === 1
-        ? new Response('{"error":true}', {status:429,headers:{'Retry-After':'30'}})
-        : json({g4keep:{version:1,outcome:'prepared',ticket,proof:proofValue}},200));
+test('stream recovery errors preserve the server Retry-After delay', async () => {
+    const h = harness('gemini-4-carbon', (_proxy, count) => count === 1 ? sse(partial) : count === 2
+        ? new Response('{"error":{"code":"G4_DELIVERY_BUSY"}}', {status:429,headers:{'Retry-After':'30'}})
+        : sse(complete));
     assert.match(await (await h.send()).text(), /NEW-RESULT/);
-    assert.deepEqual(h.delays,[30000]);assert.equal(h.calls.length,1);
+    assert.deepEqual(h.delays,[30000]);assert.deepEqual(h.calls.map(action), ['start', 'resume', 'start']);
+});
+
+test('an invalid initial Retry-After does not mask a valid recovery delay', async () => {
+    const h = harness('gemini-4-carbon', (_proxy, count) => count <= 2
+        ? new Response('{"error":true}', {status:503,headers:{'Retry-After':count === 1 ? 'invalid-value' : '90'}})
+        : count === 3 ? json({error:{code:'G4_DELIVERY_MISSING'}},410) : sse(complete));
+    assert.match(await (await h.send()).text(), /NEW-RESULT/);
+    assert.deepEqual(h.delays,[90000]);
+    assert.deepEqual(h.calls.map(action),['start','resume','resume','start']);
 });
 
 for (const code of [502, 504]) {
@@ -67,13 +69,11 @@ for (const code of [502, 504]) {
         assert.doesNotMatch(body, /OLD-PARTIAL|synthetic error/);
         assert.equal(h.calls.length, 2);
         const paths = h.calls.map(url => new URL(url).pathname.split('/').filter(Boolean));
-        assert.deepEqual(paths.map(parts => [parts[0], parts[2]]), [['g4d1', 'commit'], ['g4d1', 'commit']]);
+        assert.deepEqual(paths.map(parts => [parts[0], parts[2]]), [['g4d1', 'start'], ['g4d1', 'start']]);
         assert.match(paths[0][1], /^[0-9a-f]{32}$/);
         assert.match(paths[1][1], /^[0-9a-f]{32}$/);
         assert.notEqual(paths[0][1], paths[1][1]);
-        assert(paths.every(parts => parts[3] === ticket));
-        assert.equal(h.prepares.length, 2);
-        assert(h.prepares.every(call => call.max_tokens === 1 && call.messages[0].content === 'delivery prepare' && !call.tools));
+        assert(paths.every(parts => parts.length === 3));
         assert.deepEqual(h.delays, [1500]);
         assert.equal(h.notices.filter(x => x.kind === 'retrying').at(-1)?.attempts, 1);
     });
@@ -110,99 +110,6 @@ test('4c manual stop or chat change cancels a scheduled API retry', async () => 
     }
 });
 
-for (const model of ['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high']) {
-    for (const failure of ['http500', 'connection']) {
-        test(`${model} retries a failed prepare (${failure}) without committing the first ID`, async () => {
-            const h = harness(model, () => sse(complete), {}, { messages: [{ role: 'user', content: 'private prompt' }] },
-                (_proxy, count) => {
-                    if (count === 1) {
-                        if (failure === 'connection') throw new TypeError('connection failed');
-                        return json({ error: true }, 500);
-                    }
-                    return json({ g4keep: { version: 1, outcome: 'prepared', ticket, proof: proofValue } }, 200);
-                });
-            assert.match(await (await h.send()).text(), /NEW-RESULT/);
-            assert.equal(h.prepares.length, 2);
-            assert.equal(h.calls.length, 1);
-            assert.deepEqual(h.calls.map(action), ['commit']);
-            const ids = h.prepares.map(p => new URL(p.reverse_proxy).pathname.split('/')[2]);
-            assert.notEqual(ids[0], ids[1]);
-            assert.equal(new URL(h.calls[0]).pathname.split('/')[2], ids[1]);
-            assert(h.prepares.every(p => !JSON.stringify(p).includes('private prompt') && !p.tools));
-            assert.deepEqual(h.delays, [1500]);
-        });
-    }
-}
-
-test('prepare failures respect retry disabled, limit and manual cancellation', async () => {
-    const failPrepare = () => { throw new TypeError('connection failed'); };
-    const disabled = harness('gemini-4-carbon', () => assert.fail('no commit'), { retryApiErrors: false }, {}, failPrepare);
-    await assert.rejects(disabled.send());
-    assert.equal(disabled.prepares.length, 1); assert.deepEqual(disabled.calls, []); assert.deepEqual(disabled.delays, []);
-    const limited = harness('gemini-4-carbon', () => assert.fail('no commit'), { maxRetries: 2 }, {}, failPrepare);
-    await assert.rejects(limited.send());
-    assert.equal(limited.prepares.length, 3); assert.deepEqual(limited.calls, []); assert.deepEqual(limited.delays, [1500, 1500]);
-    for (const change of [h => h.abort.abort(), h => { h.state.key = 'another-chat'; }]) {
-        const stopped = harness('gemini-4-carbon', () => assert.fail('no commit'), {}, {}, failPrepare);
-        stopped.onNotice(notice => { if (notice.kind === 'pending') change(stopped); });
-        await assert.rejects(stopped.send());
-        assert.equal(stopped.prepares.length, 1); assert.deepEqual(stopped.calls, []);
-    }
-});
-
-test('prepare client errors do not retry', async () => {
-    for (const status of [400, 401, 403, 404, 409]) {
-        const h = harness('gemini-4-carbon', () => assert.fail('no commit'), {}, {},
-            () => json({ error: true }, status));
-        await assert.rejects(h.send());
-        assert.equal(h.prepares.length, 1); assert.deepEqual(h.calls, []); assert.deepEqual(h.delays, []);
-    }
-});
-
-test('matching not-dispatched proof after commit loss allows exactly one new generation', async () => {
-    const proof = { error: { code: 'G4_DELIVERY_NOT_DISPATCHED' }, not_dispatched: true,
-        g4keep: { version: 1, outcome: 'not_dispatched', proof: proofValue } };
-    const h = harness('gemini-4-carbon', (_proxy, count) => count === 1 ? json({ error: true }, 500)
-        : count === 2 ? json(proof, 409) : sse(complete));
-    assert.match(await (await h.send()).text(), /NEW-RESULT/);
-    assert.deepEqual(h.calls.map(action), ['commit', 'resume', 'commit']);
-    const paths = h.calls.map(url => new URL(url).pathname.split('/'));
-    assert.equal(paths[0][2], paths[1][2]); assert.notEqual(paths[1][2], paths[2][2]);
-    assert(paths.every(path => path[4] === ticket));
-    assert.equal(h.prepares.length, 2); assert.deepEqual(h.delays, [1500]);
-});
-
-test('matching not-dispatched proof after a partial stream retries without exposing the partial', async () => {
-    const proof = { error: { code: 'G4_DELIVERY_NOT_DISPATCHED' }, not_dispatched: true,
-        g4keep: { version: 1, outcome: 'not_dispatched', proof: proofValue } };
-    const h = harness('gemini-4-carbon', (_proxy, count) => count === 1 ? sse(partial)
-        : count === 2 ? json(proof, 409) : sse(complete));
-    const result = await (await h.send()).text();
-    assert.match(result, /NEW-RESULT/); assert.doesNotMatch(result, /OLD-PARTIAL/);
-    assert.deepEqual(h.calls.map(action), ['commit', 'resume', 'commit']);
-    assert.equal(h.prepares.length, 2); assert.deepEqual(h.delays, [1500]);
-});
-
-test('forged or mismatched not-dispatched proofs never authorize regeneration', async () => {
-    const valid = { error: { code: 'G4_DELIVERY_NOT_DISPATCHED' }, not_dispatched: true,
-        g4keep: { version: 1, outcome: 'not_dispatched', proof: proofValue } };
-    const proofs = [
-        { ...valid, error: { code: 'OTHER' } },
-        { ...valid, not_dispatched: false },
-        { ...valid, g4keep: { ...valid.g4keep, version: 2 } },
-        { ...valid, g4keep: { ...valid.g4keep, outcome: 'failed' } },
-        { ...valid, g4keep: { ...valid.g4keep, proof: '0'.repeat(64) } },
-        { ...valid, g4keep: { version: 1, outcome: 'not_dispatched', ticket } },
-        { error: valid.error, not_dispatched: true },
-    ];
-    for (const proof of proofs) {
-        const h = harness('gemini-4-carbon', (_proxy, count) => count === 1 ? json({ error: true }, 500) : json(proof, 409));
-        await assert.rejects(h.send(), /可能已扣费/);
-        assert.deepEqual(h.calls.map(action), ['commit', 'resume']);
-        assert.equal(h.prepares.length, 1); assert.deepEqual(h.delays, []);
-    }
-});
-
 for (const model of ['gemini-4-carbon-low', 'gemini-4-carbon-high']) {
     test(`${model} honors recorded 401/403 and retries recorded 502/504`, async () => {
         for (const code of [401, 403, 502, 504]) {
@@ -219,51 +126,96 @@ for (const model of ['gemini-4-carbon-low', 'gemini-4-carbon-high']) {
     });
 }
 
-test('4c unknown delivery failure and missing resume never regenerate', async () => {
-    const failedDelivery = harness('gemini-4-carbon', () => sse({ error: { code: 'G4_DELIVERY_FAILED' } }));
-    await assert.rejects((await failedDelivery.send()).text());
-    assert.equal(failedDelivery.calls.length, 1);
-    assert.deepEqual(failedDelivery.delays, []);
-    const missing = harness('gemini-4-carbon', (proxy) => {
-        if (action(proxy) === 'commit') throw new Error('synthetic connection loss');
-        return json({ error: { code: 'G4_DELIVERY_MISSING' } }, 410);
-    });
-    await assert.rejects(missing.send(), /可能已扣费/);
-    assert.deepEqual(missing.calls.map(action), ['commit', 'resume']);
-    assert.deepEqual(missing.delays, []);
+test('4c G4 delivery failures follow the original retry rules', async () => {
+    const h = harness('gemini-4-carbon', (_proxy, count) => count === 1
+        ? sse({ error: { code: 'G4_DELIVERY_FAILED' } }) : sse(complete));
+    assert.match(await (await h.send()).text(), /NEW-RESULT/);
+    assert.deepEqual(h.calls.map(action), ['start', 'start']);
+    assert.deepEqual(h.delays, [1500]);
 });
 
-test('4c Tavern HTTP 500 queries only the same ID and gives one visible final failure when missing', async () => {
-    const h = harness('gemini-4-carbon', proxy => action(proxy) === 'commit'
-        ? json({ error: true }, 500) : json({ error: { code: 'G4_DELIVERY_MISSING' } }, 410));
-    await assert.rejects(h.send(), /可能已扣费/);
+test('4c Tavern HTTP 500 and missing recovery retry with a fresh ID under original settings', async () => {
+    const h = harness('gemini-4-carbon', (_proxy, count) => count === 1 ? json({ error: true }, 500)
+        : count === 2 ? json({ error: { code: 'G4_DELIVERY_MISSING' } }, 410) : sse(complete));
+    assert.match(await (await h.send()).text(), /NEW-RESULT/);
     const paths = h.calls.map(url => new URL(url).pathname.split('/'));
-    assert.deepEqual(paths.map(x => x[3]), ['commit', 'resume']);
-    assert(paths.every(x => x[4] === ticket));
-    assert.equal(paths[0][2], paths[1][2]); assert.deepEqual(h.delays, []);
-    assert.equal(h.notices.filter(x => x.kind === 'delivery-error').length, 1);
+    assert.deepEqual(paths.map(x => x[3]), ['start', 'resume', 'start']);
+    assert.equal(paths[0][2], paths[1][2]); assert.notEqual(paths[0][2], paths[2][2]);
+    assert.deepEqual(h.delays, [1500]);
+    assert.equal(h.notices.filter(x => x.kind === 'delivery-error').length, 0);
 });
 
-test('4c generic proxy 500 is recovered, then only a recorded API failure can authorize a new generation', async () => {
+test('missing recovery respects retry switch, limit and manual cancellation', async () => {
+    const respond = proxy => action(proxy) === 'start' ? json({ error: true }, 500)
+        : json({ error: { code: 'G4_DELIVERY_MISSING' } }, 410);
+    const disabled = harness('gemini-4-carbon', respond, { retryApiErrors: false });
+    assert.equal((await disabled.send()).status, 410);
+    assert.deepEqual(disabled.calls.map(action), ['start', 'resume']); assert.deepEqual(disabled.delays, []);
+    const limited = harness('gemini-4-carbon', respond, { maxRetries: 2 });
+    assert.equal((await limited.send()).status, 410);
+    assert.deepEqual(limited.calls.map(action), ['start', 'resume', 'start', 'resume', 'start', 'resume']);
+    assert.deepEqual(limited.delays, [1500, 1500]); assert.equal(limited.notices.at(-1).kind, 'limit');
+    for (const change of [h => h.abort.abort(), h => { h.state.key = 'another-chat'; }]) {
+        const stopped = harness('gemini-4-carbon', respond);
+        stopped.onNotice(notice => { if (notice.kind === 'pending') change(stopped); });
+        assert.equal((await stopped.send()).status, 410);
+        assert.deepEqual(stopped.calls.map(action), ['start', 'resume']);
+    }
+});
+
+test('stream recovery authorization and permanent quota errors are not retried', async () => {
+    for (const [status, detail] of [[401, { error: { message: 'unauthorized' } }],
+        [403, { error: { message: 'forbidden' } }], [500, { error: { code: 'insufficient_quota' } }]]) {
+        const h = harness('gemini-4-carbon', (_proxy, count) => count === 1 ? sse(partial) : json(detail, status));
+        await assert.rejects((await h.send()).text());
+        assert.deepEqual(h.calls.map(action), ['start', 'resume']); assert.deepEqual(h.delays, []);
+    }
+});
+
+test('4c generic proxy 500 is recovered, then a recorded API failure follows the original policy', async () => {
     const h = harness('gemini-4-carbon', (_proxy, count) => count === 1 ? json({ error: true }, 500)
         : count === 2 ? sse(failed(502)) : sse(complete));
     assert.match(await (await h.send()).text(), /NEW-RESULT/);
     const paths = h.calls.map(url => new URL(url).pathname.split('/'));
-    assert.deepEqual(paths.map(x => x[3]), ['commit', 'resume', 'commit']);
-    assert(paths.every(x => x[4] === ticket));
+    assert.deepEqual(paths.map(x => x[3]), ['start', 'resume', 'start']);
+    assert(paths.every(x => x.length === 4));
     assert.equal(paths[0][2], paths[1][2]); assert.notEqual(paths[0][2], paths[2][2]);
     assert.deepEqual(h.delays, [1500]); assert.equal(h.notices.filter(x => x.kind === 'delivery-error').length, 0);
 });
 
-test('4c plain or malformed failure markers do not authorize regeneration', async () => {
+test('4c plain or malformed failure markers follow original SSE retry rules', async () => {
     for (const marker of [undefined, { version: 2, outcome: 'failed' }, { version: 1, outcome: 'unknown' },
         { version: 1, outcome: 'not_dispatched' }]) {
-        const h = harness('gemini-4-carbon', () => sse({ error: { code: 502, message: 'unverified' }, g4keep: marker }));
-        await assert.rejects((await h.send()).text());
-        assert.equal(h.calls.length, 1);
-        assert.deepEqual(h.delays, []);
+        const h = harness('gemini-4-carbon', (_proxy, count) => count === 1
+            ? sse({ error: { code: 502, message: 'unverified' }, g4keep: marker }) : sse(complete));
+        assert.match(await (await h.send()).text(), /NEW-RESULT/);
+        assert.equal(h.calls.length, 2);
+        assert.deepEqual(h.delays, [1500]);
     }
 });
+
+test('start HTTP 500 insufficient quota is permanent and does not resume or retry', async () => {
+    const h = harness('gemini-4-carbon', () => json({ error: { code: 'insufficient_quota', message: 'insufficient quota' } }, 500));
+    assert.equal((await h.send()).status, 500);
+    assert.deepEqual(h.calls.map(action), ['start']); assert.deepEqual(h.delays, []);
+});
+
+for (const status of [429, 503]) {
+    for (const failure of ['missing', 'network']) {
+        test(`initial ${status} Retry-After survives ${failure} recovery failure`, async () => {
+            const h = harness('gemini-4-carbon', (_proxy, count) => {
+                if (count === 1) return new Response('{"error":true}', { status, headers: { 'Retry-After': '90' } });
+                if (failure === 'missing' && count === 2) return json({ error: { code: 'G4_DELIVERY_MISSING' } }, 410);
+                if (failure === 'network' && count <= 4) throw new TypeError('network unavailable');
+                return sse(complete);
+            });
+            assert.match(await (await h.send()).text(), /NEW-RESULT/);
+            assert.deepEqual(h.delays, [90000]);
+            assert.deepEqual(h.calls.map(action), failure === 'missing'
+                ? ['start', 'resume', 'start'] : ['start', 'resume', 'resume', 'resume', 'start']);
+        });
+    }
+}
 
 test('unrelated model, proxy and source preserve their original HTTP status classification', async () => {
     for (const [model, payloadChanges] of [

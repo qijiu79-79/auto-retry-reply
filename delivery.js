@@ -1,9 +1,10 @@
-// Scoped, single-generation recovery. Retry only with proof of no dispatch.
+// Recover the same result first; failures return to the original retry policy.
+import { isRetryableApiError } from './api-error.js';
 const ENDPOINT = '/api/backends/chat-completions/generate';
 const BASE = 'https://api.doggego.online';
 const MODELS = new Set(['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high']);
 const LIMIT = 8 * 1024 * 1024;
-const FAILURE = '回复连接中断，未能取回结果；本次可能已扣费，请先检查记录，勿立即重试';
+const FAILURE = '回复连接中断，未能取回结果';
 
 function eligible(input, options, payload, baseUrl, context) {
     try {
@@ -35,16 +36,14 @@ function deliveryError(message = FAILURE) {
     return error;
 }
 
-class UndispatchedError extends Error {
-    constructor(status = 503, retryAfter = null) {
-        super('连接未成功，本次尚未提交生成');
-        this.code = 'G4_DELIVERY_NOT_DISPATCHED';
-        this.status = status;
+export class DeliveryHttpError extends Error {
+    constructor(response, detail, retryAfter = response.headers.get('Retry-After')) {
+        super(`结果取回失败：HTTP ${response.status}`);
+        this.status = response.status;
         this.retryAfter = retryAfter;
+        this.cause = detail;
     }
 }
-// Local provenance: arbitrary API errors cannot claim permission to regenerate.
-export const isUndispatchedFailure = error => error instanceof UndispatchedError;
 
 // Only the companion bridge can mark its completed API error. A plain 502/504
 // from a disconnected proxy is not evidence that the saved attempt has failed.
@@ -57,24 +56,15 @@ function eventData(frame) {
     return frame.split(/\r\n|\r|\n/).filter(x => x.startsWith('data:')).map(x => x.slice(5).replace(/^ /, '')).join('\n');
 }
 
-export async function deliveryFetch({ fetch, input, options, payload, baseUrl, context, valid, blockRetry,
+export async function deliveryFetch({ fetch, input, options, payload, baseUrl, context, valid,
     doc = globalThis.document, now = () => Date.now(), interval = setInterval, clear = clearInterval,
     tickMs = 1000, timeoutMs = 40000, graceMs = 30000, makeId = randomId }) {
     if (!eligible(input, options, payload, baseUrl, context)) return fetch(input, options);
     const id = makeId();
     if (!/^[0-9a-f]{32}$/.test(id ?? '')) return fetch(input, options);
     const signal = options.signal;
-    let ticket, proof;
-    const requestOptions = (action, privateSignal) => {
-        const path = `${BASE}/g4d1/${id}/${action}${ticket && action !== 'prepare' ? '/' + ticket : ''}`;
-        // Do not upload the prompt, tools, images or sampling settings twice.
-        const body = action === 'prepare' ? {
-            chat_completion_source: payload.chat_completion_source, model: payload.model,
-            proxy_password: payload.proxy_password, stream: true, max_tokens: 1,
-            messages: [{ role: 'user', content: 'delivery prepare' }],
-        } : payload;
-        return { ...options, signal: privateSignal, body: JSON.stringify({ ...body, reverse_proxy: path }) };
-    };
+    const requestOptions = (action, privateSignal) => ({ ...options, signal: privateSignal,
+        body: JSON.stringify({ ...payload, reverse_proxy: `${BASE}/g4d1/${id}/${action}` }) });
     let issued = false, cancelSent = false, stopped = false, current, reader;
     let timer, last = now(), idle = 0, grace = 0, visible = doc?.visibilityState !== 'hidden';
     let watchdogReject, wakeForeground;
@@ -121,10 +111,16 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
     async function connect(action) {
         if (stopped || signal?.aborted || !valid()) { terminate(); throw new DOMException('Request cancelled', 'AbortError'); }
         current = new AbortController(); resetClock(); newWatch();
-        if (action === 'prepare') issued = true;
+        if (action === 'start') issued = true;
         return Promise.race([fetch(input, requestOptions(action, current.signal)), watch]);
     }
-    let attempts = 0, response;
+    let attempts = 0, response, recoveryRetryAfter;
+    const rememberRetryAfter = response => {
+        const next = response.headers.get('Retry-After');
+        const delay = value => Number.isFinite(Number(value)) ? Number(value) * 1000 : Date.parse(value) - Date.now();
+        if (next && Number.isFinite(delay(next))
+            && (!recoveryRetryAfter || delay(next) > delay(recoveryRetryAfter))) recoveryRetryAfter = next;
+    };
     async function waitForForeground() {
         // A background network rejection is not a heartbeat timeout. Keep the
         // same generation recoverable instead of exhausting all retries while
@@ -140,70 +136,66 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
     async function transientHttp(response) {
         if (![408, 429].includes(response.status) && !(response.status >= 500 && response.status <= 599)) return false;
         // Tavern turns an upstream fetch/TLS failure into HTTP 500 {error:true}.
-        // That does not tell us whether the bridge accepted the start. Query
-        // the same ID; never translate a plain HTTP failure into a new start.
+        // Query the same ID first. If recovery fails, the original plugin's
+        // API retry settings decide whether to send another generation.
         let detail;
         try { detail = await Promise.race([response.clone().json(), watch]); } catch {}
         if (stopped || signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
-        return !String(detail?.error?.code ?? '').startsWith('G4_DELIVERY_') && !isRecordedApiFailure(detail);
+        return !String(detail?.error?.code ?? '').startsWith('G4_DELIVERY_') && !isRecordedApiFailure(detail)
+            && isRetryableApiError({error:detail,status:response.status});
     }
     const discardConnection = response => {
         current?.abort();
         response.body?.cancel().catch(() => {});
     };
-    const resume = async () => {
+    const httpFailure = async response => {
+        rememberRetryAfter(response);
+        let detail; try { detail = await Promise.race([response.clone().json(), watch]); } catch {}
+        if (stopped || signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
+        return new DeliveryHttpError(response, detail, recoveryRetryAfter);
+    };
+    const resume = async failure => {
         while (attempts < 3 && !stopped && !signal?.aborted && valid()) {
             await waitForForeground();
             attempts++;
             try {
                 const next = await connect('resume');
-                if (next.status === 409) {
-                    let detail; try { detail = await Promise.race([next.clone().json(), watch]); } catch {}
-                    if (detail?.error?.code === 'G4_DELIVERY_NOT_DISPATCHED' && detail.not_dispatched === true
-                        && detail.g4keep?.version === 1 && detail.g4keep.outcome === 'not_dispatched'
-                        && detail.g4keep.proof === proof) {
-                        discardConnection(next); throw new UndispatchedError();
-                    }
-                }
-                if (await transientHttp(next)) { discardConnection(next); continue; }
+                if (await transientHttp(next)) { failure = await httpFailure(next); discardConnection(next); continue; }
                 return next;
-            } catch (e) { if (stopped || signal?.aborted || isUndispatchedFailure(e)) throw e; }
+            } catch (e) {
+                if (stopped || signal?.aborted) throw e;
+                // Preserve the last HTTP failure and its Retry-After instead
+                // of erasing it with a later connection exception.
+                if (!(failure instanceof DeliveryHttpError)) failure = e?.name === 'AbortError' ? deliveryError() : e;
+            }
         }
-        throw deliveryError();
+        throw failure ?? deliveryError();
     };
     const fail = error => {
-        if (isUndispatchedFailure(error)) { cleanup(); throw error; }
-        if (!stopped && !signal?.aborted && error?.name !== 'AbortError') blockRetry(FAILURE);
-        cleanup(); throw error?.name === 'AbortError' ? error : deliveryError();
+        current?.abort(); cleanup(); throw error;
     };
     try {
-        // A prepare failure is safe to retry: no commit has ever been issued.
-        // Its server-side record alone cannot invoke a model, even if late.
-        try {
-            const prepared = await connect('prepare');
-            if (!prepared.ok) { discardConnection(prepared); throw new UndispatchedError(prepared.status, prepared.headers.get('Retry-After')); }
-            const detail = await Promise.race([prepared.json(), watch]);
-            if (detail?.g4keep?.version !== 1 || detail.g4keep.outcome !== 'prepared'
-                || !/^[a-f0-9]{32}$/.test(detail.g4keep.ticket ?? '')
-                || !/^[a-f0-9]{64}$/.test(detail.g4keep.proof ?? '')) throw new UndispatchedError(502);
-            ticket = detail.g4keep.ticket; proof = detail.g4keep.proof;
-        } catch (error) {
-            current?.abort();
-            await waitForForeground();
-            throw isUndispatchedFailure(error) ? error : new UndispatchedError();
-        }
         let directStartResponse = false;
-        try { response = await connect('commit'); directStartResponse = true; }
+        try { response = await connect('start'); directStartResponse = true; }
         catch (e) { if (stopped || signal?.aborted) throw e; response = await resume(); }
         if (directStartResponse && response.status === 403) {
             let error; try { error = await Promise.race([response.clone().json(), watch]); } catch {}
-            if (error?.error?.code === 'G4_DELIVERY_INELIGIBLE' && error.not_dispatched === true
-                && error.g4keep?.version === 1 && error.g4keep.outcome === 'bypassed' && error.g4keep.proof === proof) {
+            if (error?.error?.code === 'G4_DELIVERY_INELIGIBLE' && error.not_dispatched === true) {
                 cleanup(); return fetch(input, options);
             }
         }
-        if (await transientHttp(response)) { discardConnection(response); response = await resume(); }
-        if (!response.ok || !response.body) throw deliveryError();
+        if (await transientHttp(response)) {
+            const failure = await httpFailure(response); discardConnection(response); response = await resume(failure);
+        }
+        if (!response.ok) {
+            rememberRetryAfter(response);
+            if (recoveryRetryAfter) {
+                const headers = new Headers(response.headers); headers.set('Retry-After', recoveryRetryAfter);
+                response = new Response(response.body, {status:response.status,statusText:response.statusText,headers});
+            }
+            cleanup(); return response;
+        }
+        if (!response.body) throw deliveryError();
     } catch (error) { return fail(error); }
 
     const encoder = new TextEncoder();
@@ -225,9 +217,8 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
             buffered.push(raw);
             const isEnd = Boolean(json?.error) || (Array.isArray(json?.candidates) && json.candidates.some(c => typeof c?.finishReason === 'string' && c.finishReason));
             if (isEnd) {
-                if (json?.error && !isRecordedApiFailure(json)) blockRetry(FAILURE);
-                // On a recorded failure, no buffered partial reply has reached
-                // Tavern. Hand only the error back to its original retry rules.
+                // No buffered partial reply has reached Tavern. Hand only the
+                // error back to the plugin's unchanged API retry rules.
                 output.push(encoder.encode(json?.error ? raw : buffered.join('')));
                 buffered = []; complete = true; break;
             }
@@ -239,7 +230,8 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
         async start(controller) {
             try {
                 while (!complete && !stopped) {
-                    if (!response.ok || !response.body) throw deliveryError();
+                    if (!response.ok) throw await httpFailure(response);
+                    if (!response.body) throw deliveryError();
                     reader = response.body.getReader();
                     try {
                         while (!complete && !stopped) {
@@ -258,8 +250,7 @@ export async function deliveryFetch({ fetch, input, options, payload, baseUrl, c
                 if (stopped) throw new DOMException('Request cancelled', 'AbortError');
                 cleanup(); controller.close();
             } catch (error) {
-                if (!stopped && !isUndispatchedFailure(error)) blockRetry(FAILURE);
-                cleanup(); controller.error(error?.name === 'AbortError' || isUndispatchedFailure(error) ? error : deliveryError());
+                current?.abort(); cleanup(); controller.error(error);
             }
         },
         cancel() { terminate(); cleanup(); },

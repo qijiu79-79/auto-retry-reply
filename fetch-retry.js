@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Browser-only adapter. No SillyTavern source files or event definitions change.
 import { routedOptions } from './routing.js';
-import { deliveryFetch, isRecordedApiFailure, isUndispatchedFailure } from './delivery.js';
+import { deliveryFetch, isRecordedApiFailure, DeliveryHttpError } from './delivery.js';
 const ENDPOINT = '/api/backends/chat-completions/generate';
 const TYPES = new Set(['normal', 'regenerate', 'swipe', 'continue']);
 
@@ -40,17 +40,13 @@ export function createRetryFetch({ fetch: originalFetch, controller, baseUrl }) 
         const bridgeTarget = payload.chat_completion_source === 'makersuite'
             && ['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high', 'gemini-4-argon'].includes(payload.model)
             && /^https:\/\/api\.doggego\.online\/?$/.test(payload.reverse_proxy);
-        let deliveryBlocked = false;
         if (!controller.onRequestStarted(request)) return originalFetch(input, options);
 
         async function shouldRetry(error, response) {
-            if (deliveryBlocked || signal?.aborted || error?.name === 'AbortError') return false;
-            if (isUndispatchedFailure(error) && ![408, 425, 429].includes(error.status)
-                && !(error.status >= 500 && error.status <= 599)) return false;
-            if (String(error?.code ?? error?.error?.code ?? '').startsWith('G4_DELIVERY_') && !isUndispatchedFailure(error)) return false;
-            const event = { request, error, status: isUndispatchedFailure(error) ? error.status
+            if (signal?.aborted || error?.name === 'AbortError') return false;
+            const event = { request, error, status: error instanceof DeliveryHttpError ? error.status
                 : bridgeTarget && isRecordedApiFailure(error) ? error.error.code : response?.status,
-                retryAfter: isUndispatchedFailure(error) ? error.retryAfter : response?.headers.get('Retry-After'), retry: false };
+                retryAfter: error instanceof DeliveryHttpError ? error.retryAfter : response?.headers.get('Retry-After'), retry: false };
             await controller.onRequestFailed(event);
             return event.retry === true && !signal?.aborted;
         }
@@ -65,11 +61,6 @@ export function createRetryFetch({ fetch: originalFetch, controller, baseUrl }) 
                     response = await deliveryFetch({ fetch: originalFetch, input,
                         options: routedOptions(payload, options, routing), payload, baseUrl, context: routing,
                         valid: () => Boolean(controller.getRoutingContext(request)) && !signal?.aborted,
-                        blockRetry: reason => {
-                            if (deliveryBlocked) return;
-                            deliveryBlocked = true;
-                            controller.cancelRequest(request, reason, { deliveryFailure: true });
-                        },
                     });
                 } catch (error) {
                     if (await shouldRetry(error)) { retried = true; continue; }
