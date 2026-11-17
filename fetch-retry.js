@@ -2,6 +2,7 @@
 // Browser-only adapter. No SillyTavern source files or event definitions change.
 import { routedOptions } from './routing.js';
 import { deliveryFetch, isRecordedApiFailure, DeliveryHttpError } from './delivery.js';
+import { summarizeApiFailure } from './error-display.js';
 const ENDPOINT = '/api/backends/chat-completions/generate';
 const TYPES = new Set(['normal', 'regenerate', 'swipe', 'continue']);
 
@@ -10,8 +11,10 @@ function errorPayload(data) {
 }
 
 function parseFailure(text, status) {
-    try { return JSON.parse(text); }
-    catch { return new Error(`Got response status ${status}`); }
+    try { const error = JSON.parse(text); return {error, displayError:error}; }
+    // Preserve the original classifier input. Plain response text is only for
+    // sanitized display; it must not change whether this request is retried.
+    catch { const error = new Error(`Got response status ${status}`); return {error, displayError:text.trim() || error}; }
 }
 
 function frameData(frame) {
@@ -19,7 +22,7 @@ function frameData(frame) {
         .map(line => line.slice(5).replace(/^ /, '')).join('\n');
 }
 
-export function createRetryFetch({ fetch: originalFetch, controller, baseUrl }) {
+export function createRetryFetch({ fetch: originalFetch, controller, baseUrl, now = () => Date.now() }) {
     return async function retryFetch(input, options) {
         // SillyTavern uses a string URL and a reusable JSON string body. Leave
         // Request/stream bodies and every unrelated request completely alone.
@@ -37,16 +40,20 @@ export function createRetryFetch({ fetch: originalFetch, controller, baseUrl }) 
 
         const signal = options.signal;
         const request = { type: payload.type, signal };
+        let attemptStartedAt;
         const bridgeTarget = payload.chat_completion_source === 'makersuite'
             && ['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high', 'gemini-4-argon'].includes(payload.model)
             && /^https:\/\/api\.doggego\.online\/?$/.test(payload.reverse_proxy);
         if (!controller.onRequestStarted(request)) return originalFetch(input, options);
 
-        async function shouldRetry(error, response) {
+        async function shouldRetry(error, response, displayError = error) {
             if (signal?.aborted || error?.name === 'AbortError') return false;
             const event = { request, error, status: error instanceof DeliveryHttpError ? error.status
                 : bridgeTarget && isRecordedApiFailure(error) ? error.error.code : response?.status,
                 retryAfter: error instanceof DeliveryHttpError ? error.retryAfter : response?.headers.get('Retry-After'), retry: false };
+            event.diagnostic = summarizeApiFailure({error:displayError, status:event.status, model:payload.model,
+                elapsedMs:now() - attemptStartedAt,
+                secrets:[payload.proxy_password, payload.api_key, payload.custom_api_key]});
             await controller.onRequestFailed(event);
             return event.retry === true && !signal?.aborted;
         }
@@ -58,6 +65,7 @@ export function createRetryFetch({ fetch: originalFetch, controller, baseUrl }) 
                     signal?.throwIfAborted();
                     const routing = controller.getRoutingContext(request);
                     if (retried && !routing) throw new DOMException('Retry cancelled', 'AbortError');
+                    attemptStartedAt = now();
                     response = await deliveryFetch({ fetch: originalFetch, input,
                         options: routedOptions(payload, options, routing), payload, baseUrl, context: routing,
                         valid: () => Boolean(controller.getRoutingContext(request)) && !signal?.aborted,
@@ -69,10 +77,10 @@ export function createRetryFetch({ fetch: originalFetch, controller, baseUrl }) 
                 // Inspect a clone, leaving the original body available for
                 // SillyTavern's normal error reporting.
                 if (!response.ok) {
-                    let error;
-                    try { error = parseFailure(await response.clone().text(), response.status); }
+                    let error, displayError;
+                    try { ({error, displayError} = parseFailure(await response.clone().text(), response.status)); }
                     catch (failure) { error = failure; }
-                    if (await shouldRetry(error, response)) {
+                    if (await shouldRetry(error, response, displayError)) {
                         await response.body?.cancel().catch(() => {});
                         retried = true;
                         continue;

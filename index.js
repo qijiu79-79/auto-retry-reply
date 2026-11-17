@@ -4,6 +4,7 @@ import { extensionTypes } from '../../../extensions.js';
 import { createRetryController, DEFAULT_SETTINGS, normalizeSettings } from './controller.js';
 import { createRetryFetch } from './fetch-retry.js';
 import { createExtensionUpdater, refreshBlockedReason, MESSAGE_EDIT_SELECTOR } from './updater.js';
+import { createRetryNotifier } from './notifications.js';
 
 const KEY = 'auto_retry_reply';
 const context = () => SillyTavern.getContext();
@@ -24,37 +25,7 @@ function getState() {
     };
 }
 
-function notify(event) {
-    let text;
-    switch (event.kind) {
-        case 'monitoring': text = '正在等待本次回复完成…'; break;
-        case 'retrying': text = `正在自动生成第 ${event.attempts} 次重试…`; break;
-        case 'pending': {
-            const reason = event.failure.kind === 'api' ? 'API 临时错误'
-                : event.failure.kind === 'empty' ? '空回' : `关键词「${event.failure.keyword}」`;
-            text = `检测到${reason}，${event.delayMs / 1000} 秒后重试（${event.attempts}/${event.maxRetries}）`;
-            // Escape custom keywords rather than passing them to toastr as HTML.
-            toastr.info(text, '自动重试', { escapeHtml: true, timeOut: event.delayMs });
-            break;
-        }
-        case 'success': text = event.attempts ? `回复正常，本轮重试 ${event.attempts} 次后结束` : '回复正常，无需重试'; break;
-        case 'limit':
-            text = `已连续重试 ${event.attempts} 次，达到上限，已停止`;
-            toastr.warning(text, '自动重试', { escapeHtml: true });
-            break;
-        case 'error':
-            text = '自动重试失败，已停止；请检查 API 连接';
-            console.error('[auto-retry-reply]', event.error);
-            toastr.error(text, '自动重试');
-            break;
-        case 'delivery-error':
-            text = event.reason;
-            toastr.error(text, '结果取回失败', { escapeHtml: true, timeOut: 10000, extendedTimeOut: 10000 });
-            break;
-        default: text = event.reason || '已就绪';
-    }
-    if (panel) panel.querySelector('[data-status]').textContent = text;
-}
+const notify = createRetryNotifier({toastr, getPanel:() => panel});
 
 const controller = createRetryController({
     getState, getSettings: settings, notify,
@@ -111,8 +82,13 @@ function initialize() {
                     <button type="button" class="menu_button" data-action="reset-keywords">恢复默认关键词</button>
                 </div>
                 <div data-status role="status" aria-live="polite">已就绪，等待下一次模型回复</div>
+                <div data-last-error class="arr-last-error" hidden>
+                    <b>本轮最近一次失败原因</b>
+                    <div data-error-detail></div>
+                    <small>仅保留在当前页面，下一轮手动生成时清除；未提供详情时不推断网络或模型故障。</small>
+                </div>
                 <hr>
-                <small>当前版本：1.1.9 · 使用酒馆原生更新，保留原设置</small>
+                <small>当前版本：1.1.10 · 使用酒馆原生更新，保留原设置</small>
                 <div class="flex-container arr-update">
                     <button type="button" class="menu_button" data-action="check-update">检查更新</button>
                     <button type="button" class="menu_button" data-action="install-update" hidden>安装更新</button>

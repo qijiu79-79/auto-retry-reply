@@ -57,14 +57,14 @@ export function createRetryController({ getState, getSettings, retry, notify = (
         pending = null;
     }
 
-    function cancel(reason = '已取消本轮自动重试') {
+    function cancel(reason = '已取消本轮自动重试', diagnostic) {
         const hadWork = active !== null || pending !== null || launching !== null;
         apiWait?.finish(false);
         clearPending();
         active = null;
         launching = null;
         if (inFlight) inFlight.cancelled = true;
-        if (hadWork) notify({ kind: 'cancelled', reason });
+        if (hadWork) notify({ kind: 'cancelled', reason, ...(diagnostic ? {diagnostic} : {}) });
     }
 
     function sameChat(run, state) {
@@ -119,13 +119,14 @@ export function createRetryController({ getState, getSettings, retry, notify = (
         const run = requestRuns.get(event.request);
         if (!run || active !== run || apiWait || !sameChat(run, getState())) return;
         const settings = getSettings();
+        const failure = {kind:'api', ...(event.diagnostic ? {diagnostic:event.diagnostic} : {})};
         if (!settings.enabled || !settings.retryApiErrors || event.request.signal?.aborted || !isRetryableApiError(event)) {
-            cancel('API 请求失败，本轮不再自动重试');
+            cancel('API 请求失败，本轮不再自动重试', event.diagnostic);
             return;
         }
         if (run.attempts >= settings.maxRetries) {
             cancel();
-            notify({ kind: 'limit', attempts: run.attempts });
+            notify({ kind: 'limit', attempts: run.attempts, failure });
             return;
         }
 
@@ -143,7 +144,7 @@ export function createRetryController({ getState, getSettings, retry, notify = (
         }
         // Avoid overflowing setTimeout and accidentally retrying immediately.
         if (delayMs > 2147483647) return cancel('服务端要求稍后重试，请稍后手动尝试');
-        notify({ kind: 'pending', failure: { kind: 'api' }, attempts: run.attempts + 1, maxRetries: settings.maxRetries, delayMs });
+        notify({ kind: 'pending', failure, attempts: run.attempts + 1, maxRetries: settings.maxRetries, delayMs });
 
         const ready = await new Promise(resolve => {
             let timeout;
@@ -171,7 +172,7 @@ export function createRetryController({ getState, getSettings, retry, notify = (
         run.attempts++;
         run.apiRetrying = true;
         event.retry = true;
-        notify({ kind: 'retrying', attempts: run.attempts });
+        notify({ kind: 'retrying', attempts: run.attempts, failure });
     }
 
     function onReceived(id, type) {
@@ -217,7 +218,7 @@ export function createRetryController({ getState, getSettings, retry, notify = (
         }
         if (run.attempts >= settings.maxRetries) {
             active = null;
-            notify({ kind: 'limit', attempts: run.attempts });
+            notify({ kind: 'limit', attempts: run.attempts, failure });
             return;
         }
         const job = {

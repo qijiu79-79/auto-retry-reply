@@ -33,3 +33,26 @@
 #auto-retry-reply-settings .arr-update [hidden] {
     display: none;
 }
+
+#auto-retry-reply-settings [data-last-error][hidden] { display: none; }
+#auto-retry-reply-settings .arr-last-error {
+    border: 1px solid currentColor;
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 0.9em;
+}
+#auto-retry-reply-settings [data-error-detail],
+#auto-retry-reply-settings [data-status] {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+#auto-retry-reply-settings [data-error-detail] {
+    max-height: 14em;
+    overflow: auto;
+    margin-block: 6px;
+}
+
+#toast-container .arr-retry-toast .toast-message {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
