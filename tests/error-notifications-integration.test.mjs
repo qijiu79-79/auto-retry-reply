@@ -73,7 +73,7 @@ test('plain HTTP error reaches UI, but its text cannot change the original retry
     assert.match(h.status.textContent,/本轮重试 1 次/);assert.match(h.detail.textContent,/HTTP 502/);
 });
 
-for (const model of ['gemini-4-carbon','gemini-4-carbon-low','gemini-4-carbon-high']) {
+for (const model of ['gemini-4-carbon','gemini-4-carbon-low','gemini-4-carbon-high','gemini-4-neon']) {
     test(`${model} recorded SSE failure shows real 502, not the outer HTTP 200`, async () => {
         const h = harness([()=>sse(recorded),()=>sse(completed)]);
         assert.match(await (await h.send({...bridgePayload,model})).text(),/synthetic success/);

@@ -38,7 +38,7 @@ function setup(fetch, extra = {}) {
     return { args, clock, abort, blocked, invalidate: () => { live = false; } };
 }
 
-for (const model of ['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high']) {
+for (const model of ['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high', 'gemini-4-neon']) {
     test(`${model} recovers the same ID and preserves model, effort and payload`, async () => {
         const calls = [];
         const original = { ...payload, model, reasoning_effort: 'medium', max_tokens: 40000,

@@ -88,7 +88,7 @@ function initialize() {
                     <small>仅保留在当前页面，下一轮手动生成时清除；未提供详情时不推断网络或模型故障。</small>
                 </div>
                 <hr>
-                <small>当前版本：1.1.10 · 使用酒馆原生更新，保留原设置</small>
+                <small>当前版本：1.1.11 · 使用酒馆原生更新，保留原设置</small>
                 <div class="flex-container arr-update">
                     <button type="button" class="menu_button" data-action="check-update">检查更新</button>
                     <button type="button" class="menu_button" data-action="install-update" hidden>安装更新</button>

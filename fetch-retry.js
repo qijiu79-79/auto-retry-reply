@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Browser-only adapter. No SillyTavern source files or event definitions change.
 import { routedOptions } from './routing.js';
-import { deliveryFetch, isRecordedApiFailure, DeliveryHttpError } from './delivery.js';
+import { deliveryFetch, isRecordedApiFailure, DeliveryHttpError, supportsDelivery } from './delivery.js';
 import { summarizeApiFailure } from './error-display.js';
 const ENDPOINT = '/api/backends/chat-completions/generate';
 const TYPES = new Set(['normal', 'regenerate', 'swipe', 'continue']);
@@ -42,7 +42,7 @@ export function createRetryFetch({ fetch: originalFetch, controller, baseUrl, no
         const request = { type: payload.type, signal };
         let attemptStartedAt;
         const bridgeTarget = payload.chat_completion_source === 'makersuite'
-            && ['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high', 'gemini-4-argon'].includes(payload.model)
+            && (supportsDelivery(payload.model) || payload.model === 'gemini-4-argon')
             && /^https:\/\/api\.doggego\.online\/?$/.test(payload.reverse_proxy);
         if (!controller.onRequestStarted(request)) return originalFetch(input, options);
 
