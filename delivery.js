@@ -2,7 +2,7 @@
 import { isRetryableApiError } from './api-error.js';
 const ENDPOINT = '/api/backends/chat-completions/generate';
 const BASE = 'https://api.doggego.online';
-const MODELS = new Set(['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high', 'gemini-4-neon']);
+const MODELS = new Set(['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high', 'gemini-4-neon', 'gemini-4-neon-high', 'gemini-4-neon-xhigh']);
 export const supportsDelivery = model => MODELS.has(model);
 const LIMIT = 8 * 1024 * 1024;
 const FAILURE = '回复连接中断，未能取回结果';
