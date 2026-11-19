@@ -38,7 +38,7 @@ function setup(fetch, extra = {}) {
     return { args, clock, abort, blocked, invalidate: () => { live = false; } };
 }
 
-for (const model of ['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high', 'gemini-4-neon', 'gemini-4-neon-high', 'gemini-4-neon-xhigh', 'gemini-4-argon-high']) {
+for (const model of ['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-high', 'gemini-4-neon', 'gemini-4-neon-high', 'gemini-4-neon-xhigh', 'gemini-4-argon-high', 'gemini-4-carbon-medium']) {
     test(`${model} recovers the same ID and preserves model, effort and payload`, async () => {
         const calls = [];
         const original = { ...payload, model, reasoning_effort: 'medium', max_tokens: 40000,
@@ -60,7 +60,7 @@ for (const model of ['gemini-4-carbon', 'gemini-4-carbon-low', 'gemini-4-carbon-
 }
 
 test('other models and unknown Carbon suffixes do not opt into delivery', async () => {
-    for (const model of ['gemini-4-argon', 'gemini-4-hydrogen', 'gemini-4-carbon-medium',
+    for (const model of ['gemini-4-argon', 'gemini-4-hydrogen', 'gemini-4-carbon-medium-keepalive',
         'gemini-4-carbon-high-extra', 'gemini-4-carbon-high-keepalive', 'gemini-4-carbonx', 'gemini-4-neon-xhigh-keepalive']) {
         const calls = [], original = { ...payload, model };
         const env = setup((_url, options) => { calls.push(options.body); return Promise.resolve(stream([finish])); });
